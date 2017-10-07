@@ -1,6 +1,4 @@
 import re, string, pickle, numpy, pandas, mojimoji, random, os, jieba, sys
-import tensorflow as tf
-# from pyknp import Jumanpp
 from keras import optimizers
 from keras.models import Model
 from keras.layers import Embedding, Input, AveragePooling1D, MaxPooling1D, Conv1D, concatenate, TimeDistributed, \
@@ -12,11 +10,10 @@ from keras.preprocessing.sequence import pad_sequences
 from attention import AttentionWithContext
 from getShapeCode import get_all_word_bukken, get_all_character
 from janome.tokenizer import Tokenizer as JanomeTokenizer
-from keras import backend as K
 from tqdm import tqdm
 from plot_results import plot_results, save_curve_data
 from dataReader import prepare_char, prepare_word, shuffle_kv
-
+from util import slice_batch, to_multi_gpu, _make_kana_convertor
 
 # MAX_SENTENCE_LENGTH = 739  # large number as 739 makes cudnn die
 MAX_SENTENCE_LENGTH = 500
@@ -31,52 +28,11 @@ MAX_RUN = 1
 VERBOSE = 0
 EPOCHS = 50
 
-def _make_kana_convertor():
-    # by http://d.hatena.ne.jp/mohayonao/20091129/1259505966
-    """ひらがな⇔カタカナ変換器を作る"""
-    kata = {
-        'ア': 'あ', 'イ': 'い', 'ウ': 'う', 'エ': 'え', 'オ': 'お',
-        'カ': 'か', 'キ': 'き', 'ク': 'く', 'ケ': 'け', 'コ': 'こ',
-        'サ': 'さ', 'シ': 'し', 'ス': 'す', 'セ': 'せ', 'ソ': 'そ',
-        'タ': 'た', 'チ': 'ち', 'ツ': 'つ', 'テ': 'て', 'ト': 'と',
-        'ナ': 'な', 'ニ': 'に', 'ヌ': 'ぬ', 'ネ': 'ね', 'ノ': 'の',
-        'ハ': 'は', 'ヒ': 'ひ', 'フ': 'ふ', 'ヘ': 'へ', 'ホ': 'ほ',
-        'マ': 'ま', 'ミ': 'み', 'ム': 'む', 'メ': 'め', 'モ': 'も',
-        'ヤ': 'や', 'ユ': 'ゆ', 'ヨ': 'よ', 'ラ': 'ら', 'リ': 'り',
-        'ル': 'る', 'レ': 'れ', 'ロ': 'ろ', 'ワ': 'わ', 'ヲ': 'を',
-        'ン': 'ん',
-
-        'ガ': 'が', 'ギ': 'ぎ', 'グ': 'ぐ', 'ゲ': 'げ', 'ゴ': 'ご',
-        'ザ': 'ざ', 'ジ': 'じ', 'ズ': 'ず', 'ゼ': 'ぜ', 'ゾ': 'ぞ',
-        'ダ': 'だ', 'ヂ': 'ぢ', 'ヅ': 'づ', 'デ': 'で', 'ド': 'ど',
-        'バ': 'ば', 'ビ': 'び', 'ブ': 'ぶ', 'ベ': 'べ', 'ボ': 'ぼ',
-        'パ': 'ぱ', 'ピ': 'ぴ', 'プ': 'ぷ', 'ペ': 'ぺ', 'ポ': 'ぽ',
-
-        'ァ': 'ぁ', 'ィ': 'ぃ', 'ゥ': 'ぅ', 'ェ': 'ぇ', 'ォ': 'ぉ',
-        'ャ': 'ゃ', 'ュ': 'ゅ', 'ョ': 'ょ',
-        'ッ': 'っ', 'ヰ': 'ゐ', 'ヱ': 'ゑ',
-    }
-
-    # ひらがな → カタカナ のディクショナリをつくる
-    hira = dict([(v, k) for k, v in kata.items()])
-
-    re_hira2kata = re.compile("|".join(map(re.escape, hira)))
-    re_kata2hira = re.compile("|".join(map(re.escape, kata)))
-
-    def _hiragana2katakana(text):
-        return re_hira2kata.sub(lambda x: hira[x.group(0)], text)
-
-    def _katakana2hiragana(text):
-        return re_kata2hira.sub(lambda x: kata[x.group(0)], text)
-
-    return (_hiragana2katakana, _katakana2hiragana, hira.keys())
-
 
 def load_shape_data(datafile="usc-shape_bukken_data.pickle"):
     with open(datafile) as f:
         data = pickle.load(f)
     return data["words"], data["bukkens"], data["word_bukken"]
-
 
 
 def train_and_test_model(model, x_train, y_train, x_val, y_val, x_test, y_test, model_name, early_stop=False):
@@ -87,7 +43,7 @@ def train_and_test_model(model, x_train, y_train, x_val, y_val, x_test, y_test, 
         stopper = EarlyStopping(monitor='val_loss', patience=10)
     checkpoint_loss = ModelCheckpoint(filepath="checkpoints/" + model_name + "_bestloss.hdf5", monitor="val_loss",
                                       verbose=VERBOSE, save_best_only=True, mode="min")
-    print("compling...")
+    print("complisng...")
     model.compile(loss="categorical_crossentropy", optimizer="rmsprop", metrics=['categorical_crossentropy', "acc"], )
     print("fitting...")
     if early_stop:
@@ -111,7 +67,8 @@ def predict_value(model, model_name, x_test):
     model.compile(loss="categorical_crossentropy", optimizer="rmsprop", metrics=['categorical_crossentropy'], )
     model.load_weights("checkpoints/" + model_name + "_bestloss.hdf5")
     predicted = model.predict(x_test, verbose=1)
-    numpy.savetxt(model_name+"_predict.data", predicted, fmt='%1.10f')
+    numpy.savetxt(model_name + "_predict.data", predicted, fmt='%1.10f')
+
 
 def get_vocab(shuffle=False):
     # convert kata to hira
@@ -201,9 +158,9 @@ def text_to_char_index(full_vocab, real_vocab_number, chara_bukken_revised, sent
             else:
                 int_text += comps + [0] * (comp_width - len(comps))
         else:
-            if shuffle=="random":
-                if i<real_vocab_number:
-                    i = (i+20)%real_vocab_number
+            if shuffle == "random":
+                if i < real_vocab_number:
+                    i = (i + 20) % real_vocab_number
             int_text += [i] + [0] * (comp_width - 1)
     return int_text
 
@@ -448,7 +405,8 @@ def split_data(data_shape, data_char, data_word, labels):
            x1_test, x2_test, x3_test, y_test
 
 
-def prepare_ChnSenti_classification(filename="ChnSentiCorp_htl_unba_10000/", dev_mode=False, skip_unk=False, shuffle=None):
+def prepare_ChnSenti_classification(filename="ChnSentiCorp_htl_unba_10000/", dev_mode=False, skip_unk=False,
+                                    shuffle=None):
     # get vocab
     full_vocab, real_vocab_number, chara_bukken_revised, addtional_translate, hira_punc_number_latin = get_vocab()
     n_hira_punc_number_latin = len(hira_punc_number_latin) + 2
@@ -629,7 +587,6 @@ def do_ChnSenti_classification_multimodel(filename, dev_mode=False, cnn_encoder=
     result_char = None
     result_word = None
 
-
     if char_shape_only:
         for highway_option in highway_options:
             for nohighway_option in nohighway_options:
@@ -646,7 +603,7 @@ def do_ChnSenti_classification_multimodel(filename, dev_mode=False, cnn_encoder=
                                                attention=attention_option, shape_filter=shape_filter,
                                                char_filter=char_filter)
                     result_shape = train_and_test_model(model, x1_train, y_train, x1_val, y_val, x1_test, y_test,
-                                                  data_set_name + "model" + str(model_index))
+                                                        data_set_name + "model" + str(model_index))
 
     if char_only:
         for highway_option in highway_options:
@@ -664,7 +621,7 @@ def do_ChnSenti_classification_multimodel(filename, dev_mode=False, cnn_encoder=
                                                nohighway=nohighway_option,
                                                shape_filter=shape_filter, char_filter=char_filter)
                     result_char = train_and_test_model(model, x3_train, y_train, x3_val, y_val, x3_test, y_test,
-                                         data_set_name + "model" + str(model_index))
+                                                       data_set_name + "model" + str(model_index))
 
     if word_only:
         for highway_option in highway_options:
@@ -682,7 +639,7 @@ def do_ChnSenti_classification_multimodel(filename, dev_mode=False, cnn_encoder=
                                                nohighway=nohighway_option,
                                                shape_filter=shape_filter, char_filter=char_filter)
                     result_word = train_and_test_model(model, x2_train, y_train, x2_val, y_val, x2_test, y_test,
-                                         data_set_name + "model" + str(model_index))
+                                                       data_set_name + "model" + str(model_index))
 
     if hatt:
         model_index += 1
@@ -957,222 +914,6 @@ def do_rakuten_senti_classification_multimodel(datasize, attention=False, cnn_en
     return result
 
 
-def test_classifier(attention=False, cnn_encoder=True):
-    x1_train_0 = numpy.random.normal(loc=4.0, scale=2.0, size=(500, MAX_SENTENCE_LENGTH, COMP_WIDTH * MAX_WORD_LENGTH))
-    x1_train_1 = numpy.random.uniform(low=5, high=10, size=(500, MAX_SENTENCE_LENGTH, COMP_WIDTH * MAX_WORD_LENGTH))
-    x2_train_0 = numpy.random.normal(loc=4.0, scale=2.0, size=(500, MAX_SENTENCE_LENGTH))
-    x2_train_1 = numpy.random.uniform(low=5, high=10, size=(500, MAX_SENTENCE_LENGTH))
-    x1_data = numpy.concatenate((x1_train_0, x1_train_1), axis=0)
-    x2_data = numpy.concatenate((x2_train_0, x2_train_1), axis=0)
-    labels = [0] * 500 + [1] * 500
-    y_data = to_categorical(numpy.asarray(labels))
-
-    indices = numpy.arange(x1_data.shape[0])
-    numpy.random.shuffle(indices)
-    data_char = x1_data[indices]
-    data_word = x2_data[indices]
-    y_data = y_data[indices]
-    nb_validation_samples = int(VALIDATION_SPLIT * data_char.shape[0])
-
-    x1_train = data_char[:-nb_validation_samples]
-    x2_train = data_word[:-nb_validation_samples]
-    y_train = y_data[:-nb_validation_samples]
-    x1_val = data_char[-nb_validation_samples:]
-    x2_val = data_word[-nb_validation_samples:]
-    y_val = y_data[-nb_validation_samples:]
-
-    word_vocab_size = 10
-
-    print("Char Only")
-    sgd = optimizers.SGD(lr=0.01, momentum=0.9)
-    reducelr = ReduceLROnPlateau(monitor='val_loss', factor=0.1, patience=10)
-    stopper = EarlyStopping(monitor='val_loss', patience=50)
-    model2 = build_sentence_rnn(real_vocab_number=10, classes=2,
-                                attention=attention, word=False, cnn_encoder=cnn_encoder)
-    model2.compile(loss='categorical_crossentropy',
-                   optimizer=sgd,
-                   metrics=['acc'], )
-    model2.fit(x1_train, y_train, validation_data=(x1_val, y_val),
-               epochs=15, batch_size=BATCH_SIZE,
-               callbacks=[reducelr, stopper])
-
-    print("Word Only")
-    sgd = optimizers.SGD(lr=0.01, momentum=0.9)
-    model4 = build_sentence_rnn(real_vocab_number=10, word_vocab_size=word_vocab_size,
-                                classes=2, attention=attention, char_shape=False,
-                                cnn_encoder=cnn_encoder)
-    model4.compile(loss='categorical_crossentropy',
-                   optimizer=sgd,
-                   metrics=['acc'])
-    model4.fit(x2_train, y_train, validation_data=(x2_val, y_val),
-               epochs=15, batch_size=BATCH_SIZE,
-               callbacks=[reducelr, stopper])
-
-
-def test_HATT():
-    x_train_0 = numpy.random.normal(loc=4.0, scale=2.0, size=(500, MAX_SENTENCE_LENGTH))
-    x_train_1 = numpy.random.uniform(low=5, high=10, size=(500, MAX_SENTENCE_LENGTH))
-    x_data = numpy.concatenate((x_train_0, x_train_1), axis=0)
-    labels = [0] * 500 + [1] * 500
-    y_data = to_categorical(numpy.asarray(labels))
-    indices = numpy.arange(x_data.shape[0])
-    numpy.random.shuffle(indices)
-    data_word = x_data[indices]
-    y_data = y_data[indices]
-    nb_validation_samples = int(VALIDATION_SPLIT * data_word.shape[0])
-
-    x_train = data_word[:-nb_validation_samples]
-    y_train = y_data[:-nb_validation_samples]
-    x_val = data_word[-nb_validation_samples:]
-    y_val = y_data[-nb_validation_samples:]
-
-    word_vocab_size = 10
-
-    x_train = numpy.reshape(x_train, (x_train.shape[0], 5, 100))
-    x_val = numpy.reshape(x_val, (x_val.shape[0], 5, 100))
-
-    model = build_hatt(word_vocab_size, 2)
-    model.compile(loss="categorical_crossentropy", optimizer="rmsprop", metrics=["acc"], )
-    model.fit(x_train, y_train, validation_data=(x_val, y_val), epochs=15, batch_size=BATCH_SIZE)
-
-
-def test_fasttext():
-    x_train_0 = numpy.random.normal(loc=4.0, scale=2.0, size=(500, MAX_SENTENCE_LENGTH))
-    x_train_1 = numpy.random.uniform(low=5, high=10, size=(500, MAX_SENTENCE_LENGTH))
-    x_data = numpy.concatenate((x_train_0, x_train_1), axis=0)
-    labels = [0] * 500 + [1] * 500
-    y_data = to_categorical(numpy.asarray(labels))
-    indices = numpy.arange(x_data.shape[0])
-    numpy.random.shuffle(indices)
-    data_word = x_data[indices]
-    y_data = y_data[indices]
-    nb_validation_samples = int(VALIDATION_SPLIT * data_word.shape[0])
-
-    x_train = data_word[:-nb_validation_samples]
-    y_train = y_data[:-nb_validation_samples]
-    x_test = x_val = data_word[-nb_validation_samples:]
-    y_test = y_val = y_data[-nb_validation_samples:]
-
-    word_vocab_size = 10
-
-    results={}
-    for k in ["aaaaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccccc"]:
-        model = build_fasttext(word_vocab_size, 2)
-        results[k] = train_and_test_model(model, x_train, y_train, x_val, y_val, x_test, y_test, k)
-    plot_results(results, "ut")
-
-    results = {}
-    for k in ["aaaaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccccc"]:
-        model = build_fasttext(word_vocab_size, 2)
-        results[k] = train_and_test_model(model, x_train, y_train, x_val, y_val, x_test, y_test, k)
-    plot_results(results, "ut2")
-    save_curve_data(results, "ut2")
-
-
-def slice_batch(x, n_gpus, part):
-    sh = K.shape(x)
-    L = sh[0] / n_gpus
-    L = tf.to_int32(L)
-    if part == n_gpus - 1:
-        return x[part * L:]
-    return x[part * L:(part + 1) * L]
-
-
-def to_multi_gpu(model, n_gpus=2):
-    with tf.device('/cpu:0'):
-        x = Input(model.input_shape[1:], name=model.input_names[0])
-    towers = []
-    for g in range(n_gpus):
-        with tf.device('/gpu:' + str(g)):
-            slice_g = Lambda(slice_batch, lambda shape: shape,
-                             arguments={'n_gpus': n_gpus, 'part': g})(x)
-            towers.append(model(slice_g))
-    with tf.device('/cpu:0'):
-        merged = concatenate(towers, axis=0)
-    return Model(inputs=x, outputs=merged)
-
-
-
-def limited_dict_experiment(lang):
-    print(lang, flush=True)
-    dict_limit = 2489
-    print("character")
-    x_train, y_train, x_val, y_val, x_test, y_test, char_vocab_size = prepare_char(lang, dict_limit=dict_limit)
-    model = build_sentence_rnn(real_vocab_number=2000, char_vocab_size=char_vocab_size, classes=2,
-                               attention=False, word=False, char=True, char_shape=False, highway='relu',
-                               nohighway=None)
-    train_and_test_model(model, x_train, y_train, x_val, y_val, x_test, y_test, "character_limit_dict_2489")
-    print("word")
-    x_train, y_train, x_val, y_val, x_test, y_test, word_vocab_size = prepare_word(lang, dict_limit=dict_limit)
-    model = build_sentence_rnn(real_vocab_number=2000, word_vocab_size=word_vocab_size, classes=2,
-                               attention=True, word=True, char=False, char_shape=False, highway='relu',
-                               nohighway=None)
-    train_and_test_model(model, x_train, y_train, x_val, y_val, x_test, y_test, "word_rnn_limit_dict_2489")
-    model = build_fasttext(word_vocab_size, 2)
-    train_and_test_model(model, x_train, y_train, x_val, y_val, x_test, y_test, "word_fasttext_limit_dict_2489")
-    _x_train = numpy.reshape(x_train, (x_train.shape[0], 5, 100))
-    _x_val = numpy.reshape(x_val, (x_val.shape[0], 5, 100))
-    _x_test = numpy.reshape(x_test, (x_test.shape[0], 5, 100))
-    model = build_hatt(word_vocab_size, 2)
-    train_and_test_model(model, _x_train, y_train, _x_val, y_val, _x_test, y_test, "word_hatt_limit_dict_2489")
-
-def do_char_based_deformation_ex(lang):
-    print(lang, flush=True)
-    results = {}
-    dirname = lang + "_Char_embedding_deformation"
-    models_names = ["True Data", "In-word Characters Shuffled", "Words Swapped"]
-    for i, shuffle in enumerate([None, "shuffle", "random"]):
-        model_name = models_names[i]
-        x_train, y_train, x_val, y_val, x_test, y_test, char_vocab_size = prepare_char(lang, shuffle)
-        model = build_sentence_rnn(real_vocab_number=2000, char_vocab_size=char_vocab_size, classes=2,
-                                   attention=False, word=False, char=True, char_shape=False, highway='relu',
-                                   nohighway=None)
-        results[model_name] = train_and_test_model(model, x_train, y_train, x_val, y_val, x_test, y_test, model_name)
-    plot_results(results, dirname)
-    save_curve_data(results, "do_char_based_deformation_ex.pickle")
-
-
-def deformation_experiment_c():
-    # random shape / mirror flip shape
-    print("Ctrip", flush=True)
-    results = {}
-    dirname = "ChnSentiCorp_htl_unba_10000/"
-    models_names = ["True Data", "Fake Data: Random", "Fake Data: Mirror"]
-    for i, shuffle in enumerate([None, "random", "flip"]):
-        model_name = models_names[i]
-        results[model_name] = do_ChnSenti_classification_multimodel(filename=dirname,
-                                                                    char_only=False,
-                                                                    word_only=False,
-                                                                    hatt=False,
-                                                                    fasttext=False,
-                                                                    highway_options=[None],
-                                                                    nohighway_options=["linear"],
-                                                                    attention_options=[None],
-                                                                    shuffle=shuffle)
-    plot_results(results, dirname[dirname.find("Chn"):-1])
-    save_curve_data(results, "deformation_experiment_c.pickle")
-
-
-def deformation_experiment_j():
-    # random shape / mirror flip shape
-    print("Rakuten", flush=True)
-    results = {}
-    models_names = ["True Data", "Fake Data: Random", "Fake Data: Mirror"]
-    for i, shuffle in enumerate([None, "random", "flip"]):
-        model_name = models_names[i]
-        results[model_name] = do_rakuten_senti_classification_multimodel(datasize=10000,
-                                                                         char_only=False,
-                                                                         word_only=False,
-                                                                         hatt=False,
-                                                                         fasttext=False,
-                                                                         highway_options=[None],
-                                                                         nohighway_options=["linear"],
-                                                                         attention_options=[None],
-                                                                         shuffle=shuffle)
-    plot_results(results, "rakuten_10k")
-    save_curve_data(results, "deformation_experiment_j.pickle")
-
-
 def visualize_embedding():
     print("1")
     (full_vocab, real_vocab_number, chara_bukken_revised, word_vocab, char_vocab,
@@ -1195,44 +936,7 @@ def visualize_embedding():
     model.fit(x1_train, y_train, validation_data=(x1_val, y_val), epochs=30, batch_size=BATCH_SIZE,
               callbacks=[tb_cb, stopper])
 
+
 if __name__ == "__main__":
-    # Test Vocab
-    # print(build_jp_embedding())
-    #
-    # for i in [4000, 5000, 8000]:
-    #     print(full_vocab[i], chara_bukken_revised[i], [full_vocab[k] for k in chara_bukken_revised[i]])
-    #
-    # print(text_to_char_index(full_vocab=full_vocab, real_vocab_number=real_vocab_number,
-    #                          chara_bukken_revised=chara_bukken_revised, mode="padding", comp_width=3))
-
-    # from keras.models import Sequential
-
-    # Test Word Encoder
-    # model = build_word_feature()
-    # model.compile('rmsprop', 'mse')
-    # input_array = numpy.random.randint(5, size=(MAX_SENTENCE_LENGTH, COMP_WIDTH * MAX_WORD_LENGTH))
-    # output_array = model.predict(input_array)
-    # print(output_array.shape)
-    # print(output_array[0])
-
-    # Test Sentence Encoder
-    # model = build_sentence_rnn(real_vocab_number=5, classes=2, attention=True, word=True, char_shape=True)
-    # model.compile('rmsprop', 'mse')
-    # input1_array = numpy.random.randint(5, size=(30, MAX_SENTENCE_LENGTH, COMP_WIDTH * MAX_WORD_LENGTH))
-    # input2_array = numpy.random.randint(5, size=(30, MAX_SENTENCE_LENGTH, ))
-    # output_array = model.predict([input1_array, input2_array])
-    # print(output_array.shape)
-    # test_fasttext()
-
     do_ChnSenti_classification_multimodel("ChnSentiCorp_htl_unba_10000/")
     # do_rakuten_senti_classification_multimodel(datasize=10000)
-    #
-    # deformation_experiment_c()
-    # deformation_experiment_j()
-    #
-    # do_char_based_deformation_ex("CH")
-    # do_char_based_deformation_ex("JP")
-    # limited_dict_experiment("CH")
-    # limited_dict_experiment("JP")
-
-    # visualize_embedding()
