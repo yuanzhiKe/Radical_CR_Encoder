@@ -1,15 +1,12 @@
-import re, string, pickle, numpy, pandas, mojimoji, random, os, jieba, sys
-from keras import optimizers
+import string, pickle, numpy, mojimoji, os, jieba, sys
 from keras.models import Model
 from keras.layers import Embedding, Input, AveragePooling1D, MaxPooling1D, Conv1D, concatenate, TimeDistributed, \
-    Bidirectional, LSTM, Dense, Flatten, GRU, Lambda
+    Bidirectional, LSTM, Dense, Flatten, GRU
 from keras.legacy.layers import Highway
-from keras.callbacks import ReduceLROnPlateau, EarlyStopping, CSVLogger, ModelCheckpoint, TensorBoard
+from keras.callbacks import ReduceLROnPlateau, EarlyStopping, ModelCheckpoint, TensorBoard
 from keras.utils.np_utils import to_categorical
-from keras.preprocessing.sequence import pad_sequences
 from attention import AttentionWithContext
 from getShapeCode import get_all_word_bukken, get_all_character
-from janome.tokenizer import Tokenizer as JanomeTokenizer
 from tqdm import tqdm
 from plot_results import plot_results, save_curve_data
 from dataReader import prepare_char, prepare_word, shuffle_kv
